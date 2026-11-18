@@ -577,28 +577,16 @@ impl HeadlessServer {
             crate::kitty_graphics::HostCellSize::default()
         };
         let area = Rect::new(0, 0, cols, rows);
+        crate::ui::compute_tab_surface_for(
+            &self.app.state,
+            &self.app.terminal_runtimes,
+            Some(target),
+            area,
+            true,
+            cell_size,
+        );
         if self.app_client_count() == 1 {
-            for (workspace_index, workspace) in self.app.state.workspaces.iter().enumerate() {
-                for tab_index in 0..workspace.tabs.len() {
-                    crate::ui::resize_tab_surface(
-                        &self.app.state,
-                        &self.app.terminal_runtimes,
-                        workspace_index,
-                        tab_index,
-                        area,
-                        cell_size,
-                    );
-                }
-            }
-        } else {
-            crate::ui::compute_tab_surface_for(
-                &self.app.state,
-                &self.app.terminal_runtimes,
-                Some(target),
-                area,
-                true,
-                cell_size,
-            );
+            self.dequeue_hidden_resize(target);
         }
         if self
             .popup_owner_tab_id
@@ -608,6 +596,75 @@ impl HeadlessServer {
             let _ = resize_popup_runtime(&self.app, Rect::new(0, 0, cols, rows), cell_size);
         }
         true
+    }
+
+    /// A host resize makes every hidden tab stale again: requeue them and restart the
+    /// settle timer. The viewed tab was resized already.
+    pub(super) fn requeue_hidden_resize(&mut self, client_id: u64) {
+        if self.app_client_count() != 1 {
+            return;
+        }
+        let viewed = self
+            .shell_target_for_client(client_id)
+            .and_then(|target| self.tab_id_for_target(target));
+        self.hidden_resize.tabs = (0..self.app.state.workspaces.len())
+            .flat_map(|ws| (0..self.app.state.workspaces[ws].tabs.len()).map(move |tab| (ws, tab)))
+            .filter_map(|(ws, tab)| self.app.public_tab_id(ws, tab))
+            .filter(|id| Some(id) != viewed.as_ref())
+            .collect();
+        self.hidden_resize.due = Some(Instant::now() + HIDDEN_RESIZE_SETTLE);
+    }
+
+    /// The viewed tab was just resized, so it needs no paced resize.
+    fn dequeue_hidden_resize(&mut self, target: crate::ui::TabSurfaceTarget) {
+        let viewed = self.tab_id_for_target(target);
+        self.hidden_resize
+            .tabs
+            .retain(|id| Some(id) != viewed.as_ref());
+        if self.hidden_resize.tabs.is_empty() {
+            self.hidden_resize.due = None;
+        }
+    }
+
+    /// Resizes the next queued hidden tab once its deadline has passed.
+    pub(super) fn drain_hidden_resize(&mut self, now: Instant) {
+        if self.hidden_resize.due.is_none_or(|due| now < due) {
+            return;
+        }
+        let geometry = self
+            .clients
+            .values()
+            .find(|client| client.is_active_shell_client() && client.writer.is_some())
+            .filter(|_| self.app_client_count() == 1)
+            .map(|client| {
+                let (cols, rows) = client.terminal_size;
+                let cell_size = if client.cell_size.is_known() {
+                    client.cell_size
+                } else {
+                    crate::kitty_graphics::HostCellSize::default()
+                };
+                (Rect::new(0, 0, cols, rows), cell_size)
+            });
+        let Some((area, cell_size)) = geometry else {
+            self.hidden_resize = HiddenResizeQueue::default();
+            return;
+        };
+        // Tabs closed while queued no longer resolve and are skipped.
+        while let Some(id) = self.hidden_resize.tabs.pop_front() {
+            if let Some((workspace_index, tab_index)) = self.app.parse_tab_id(&id) {
+                crate::ui::resize_tab_surface(
+                    &self.app.state,
+                    &self.app.terminal_runtimes,
+                    workspace_index,
+                    tab_index,
+                    area,
+                    cell_size,
+                );
+                break;
+            }
+        }
+        self.hidden_resize.due =
+            (!self.hidden_resize.tabs.is_empty()).then_some(now + HIDDEN_RESIZE_INTERVAL);
     }
 
     pub(super) fn resize_tabs_for_only_shell_client(
@@ -627,7 +684,11 @@ impl HeadlessServer {
         }) else {
             return false;
         };
-        self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes)
+        let applied = self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes);
+        if applied {
+            self.requeue_hidden_resize(client_id);
+        }
+        applied
     }
 
     pub(super) fn reapply_controlled_shell_tab_geometry(
@@ -705,10 +766,25 @@ impl HeadlessServer {
         let Some(tab_id) = self.shell_tab_id_for_client(client_id) else {
             return false;
         };
+        // A client's first claim is an attach: hidden tabs may be at an older size.
+        let attaching = !self
+            .tab_geometry_controllers
+            .values()
+            .any(|&controller| controller == client_id);
         if self.tab_geometry_controllers.insert(tab_id, client_id) == Some(client_id) {
+            // A hidden tab queued for a paced resize catches up as soon as it is viewed.
+            if self.app_client_count() == 1 {
+                if let Some(target) = self.shell_target_for_client(client_id) {
+                    self.resize_shell_tab_geometry_to_target(client_id, target);
+                }
+            }
             return false;
         }
-        self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes)
+        let applied = self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes);
+        if applied && attaching {
+            self.requeue_hidden_resize(client_id);
+        }
+        applied
     }
 
     pub(super) fn claim_unowned_shell_tab_geometry(
@@ -729,8 +805,16 @@ impl HeadlessServer {
         if self.tab_geometry_controllers.contains_key(&tab_id) {
             return false;
         }
+        let attaching = !self
+            .tab_geometry_controllers
+            .values()
+            .any(|&controller| controller == client_id);
         self.tab_geometry_controllers.insert(tab_id, client_id);
-        self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes)
+        let applied = self.apply_shell_tab_geometry(client_id, start_pending_agent_resumes);
+        if applied && attaching {
+            self.requeue_hidden_resize(client_id);
+        }
+        applied
     }
 
     pub(super) fn resize_shell_tab_if_controller(
