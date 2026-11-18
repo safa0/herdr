@@ -115,6 +115,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         next_client_id: 1,
         foreground_client_id: None,
         tab_geometry_controllers: HashMap::new(),
+        hidden_resize: HiddenResizeQueue::default(),
         popup_owner_tab_id: None,
         client_shell_boot_id: "test-boot".into(),
         sent_window_title: None,
@@ -2448,6 +2449,13 @@ async fn geometry_reapply_replaces_a_controller_that_left_the_tab() {
     shutdown_test_runtimes(&mut server);
 }
 
+/// Advances the clock through the paced hidden-tab resizes until the queue is empty.
+fn drain_hidden_resizes(server: &mut HeadlessServer) {
+    while let Some(due) = server.hidden_resize.due {
+        server.drain_hidden_resize(due);
+    }
+}
+
 #[tokio::test]
 async fn client_shell_tabs_render_accept_input_and_resize_independently() {
     let mut server = test_headless_server();
@@ -2480,6 +2488,7 @@ async fn client_shell_tabs_render_accept_input_and_resize_independently() {
     let (first_control, first_render) = connect_test_shell(&mut server, 21, 100, 30);
     let _ = first_control.recv().expect("first snapshot");
     let first_size = server.app.state.workspaces[0].test_runtimes[&first_pane].current_size();
+    drain_hidden_resizes(&mut server);
     let singleton_second_size =
         server.app.state.workspaces[0].test_runtimes[&second_pane].current_size();
     assert_ne!(singleton_second_size, initial_second_size);
@@ -2544,6 +2553,7 @@ async fn client_shell_tabs_render_accept_input_and_resize_independently() {
     );
 
     server.remove_client_and_resize_if_needed(21);
+    drain_hidden_resizes(&mut server);
     let singleton_first = server.app.state.workspaces[0].test_runtimes[&first_pane].current_size();
     let singleton_second =
         server.app.state.workspaces[0].test_runtimes[&second_pane].current_size();
@@ -8427,4 +8437,196 @@ fn no_handle_internal_event_bypass_in_module() {
              handle_internal_event_with_forwarding (bypass risk):\n  {}",
         bypass_lines.join("\n  ")
     );
+}
+
+fn paced_server() -> (HeadlessServer, Vec<crate::layout::PaneId>, Vec<String>) {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("paced-resize");
+    let mut panes = vec![workspace.tabs[0].root_pane];
+    for name in ["second", "third", "fourth"] {
+        let tab = workspace.test_add_tab(Some(name));
+        panes.push(workspace.tabs[tab].root_pane);
+    }
+    for &pane_id in &panes {
+        workspace.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+    }
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let tab_ids = (0..panes.len())
+        .map(|tab| server.app.public_tab_id(0, tab).unwrap())
+        .collect();
+    (server, panes, tab_ids)
+}
+
+/// Number of real reflows a pane runtime has performed (each bumps content_seq twice).
+fn resize_count(server: &HeadlessServer, pane: crate::layout::PaneId) -> u64 {
+    server.app.state.workspaces[0].test_runtimes[&pane].content_seq() / 2
+}
+
+fn pane_size(server: &HeadlessServer, pane: crate::layout::PaneId) -> (u16, u16) {
+    server.app.state.workspaces[0].test_runtimes[&pane].current_size()
+}
+
+fn send_shell_resize(server: &mut HeadlessServer, client_id: u64, cols: u16, rows: u16) {
+    server.handle_server_event(ServerEvent::ClientShellResize {
+        client_id,
+        surface_cols: cols,
+        surface_rows: rows,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        pixel_mouse: false,
+    });
+}
+
+#[tokio::test]
+async fn paced_burst_resizes_hidden_tabs_one_per_interval_after_settle() {
+    let (mut server, panes, _) = paced_server();
+    let (control, _) = connect_test_shell(&mut server, 90, 100, 30);
+    let _ = control.recv().expect("snapshot");
+    let before: Vec<u64> = panes.iter().map(|&p| resize_count(&server, p)).collect();
+
+    for step in 0..10u16 {
+        send_shell_resize(&mut server, 90, 101 + step, 30 + step);
+    }
+    assert_eq!(resize_count(&server, panes[0]) - before[0], 10);
+    for i in 1..panes.len() {
+        assert_eq!(resize_count(&server, panes[i]) - before[i], 0, "tab {i}");
+    }
+
+    // Nothing moves before the settle deadline; then one tab per interval.
+    let settle = server.hidden_resize.due.expect("queued");
+    server.drain_hidden_resize(settle - Duration::from_millis(1));
+    assert_eq!(resize_count(&server, panes[1]) - before[1], 0);
+    let mut now = settle;
+    for done in 1..panes.len() {
+        server.drain_hidden_resize(now);
+        let resized = (1..panes.len())
+            .filter(|&i| resize_count(&server, panes[i]) > before[i])
+            .count();
+        assert_eq!(resized, done);
+        match server.hidden_resize.due {
+            Some(next) => {
+                assert_eq!(next - now, Duration::from_millis(500));
+                server.drain_hidden_resize(next - Duration::from_millis(1));
+                assert_eq!(
+                    (1..panes.len())
+                        .filter(|&i| resize_count(&server, panes[i]) > before[i])
+                        .count(),
+                    done
+                );
+                now = next;
+            }
+            None => assert_eq!(done, panes.len() - 1),
+        }
+    }
+    for i in 1..panes.len() {
+        assert_eq!(resize_count(&server, panes[i]) - before[i], 1, "tab {i}");
+        assert_eq!(pane_size(&server, panes[i]), pane_size(&server, panes[0]));
+    }
+    assert!(server.hidden_resize.due.is_none());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn paced_resize_during_drain_restarts_and_requeues_stale_tabs() {
+    let (mut server, panes, _) = paced_server();
+    let (control, _) = connect_test_shell(&mut server, 91, 100, 30);
+    let _ = control.recv().expect("snapshot");
+    send_shell_resize(&mut server, 91, 110, 32);
+    let due = server.hidden_resize.due.expect("queued");
+    server.drain_hidden_resize(due);
+    assert_eq!(server.hidden_resize.tabs.len(), 2);
+
+    send_shell_resize(&mut server, 91, 120, 34);
+    assert_eq!(server.hidden_resize.tabs.len(), 3);
+    let restarted = server.hidden_resize.due.expect("restarted");
+    assert!(restarted > due);
+    drain_hidden_resizes(&mut server);
+    for &pane in &panes[1..] {
+        assert_eq!(pane_size(&server, pane), pane_size(&server, panes[0]));
+    }
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn paced_focus_of_queued_tab_resizes_it_now_and_not_again() {
+    let (mut server, panes, tab_ids) = paced_server();
+    let (control, _) = connect_test_shell(&mut server, 92, 100, 30);
+    let _ = control.recv().expect("snapshot");
+    send_shell_resize(&mut server, 92, 110, 32);
+    let before = resize_count(&server, panes[2]);
+
+    assert!(server.focus_shell_client_on_tab(92, &tab_ids[2]));
+    assert!(server.claim_shell_tab_geometry(92, false));
+    assert_eq!(resize_count(&server, panes[2]) - before, 1);
+    assert_eq!(pane_size(&server, panes[2]), pane_size(&server, panes[0]));
+    assert!(!server.hidden_resize.tabs.contains(&tab_ids[2]));
+
+    drain_hidden_resizes(&mut server);
+    assert_eq!(resize_count(&server, panes[2]) - before, 1);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn paced_refocus_of_controlled_queued_tab_resizes_it_now() {
+    let (mut server, panes, tab_ids) = paced_server();
+    let (control, _) = connect_test_shell(&mut server, 93, 100, 30);
+    let _ = control.recv().expect("snapshot");
+    assert!(server.focus_shell_client_on_tab(93, &tab_ids[1]));
+    assert!(server.claim_shell_tab_geometry(93, false));
+    assert!(server.focus_shell_client_on_tab(93, &tab_ids[0]));
+    let _ = server.claim_shell_tab_geometry(93, false);
+    for step in 0..5u16 {
+        send_shell_resize(&mut server, 93, 90 + step, 28 + step);
+    }
+    assert_ne!(pane_size(&server, panes[1]), pane_size(&server, panes[0]));
+
+    assert!(server.focus_shell_client_on_tab(93, &tab_ids[1]));
+    assert!(!server.claim_shell_tab_geometry(93, false));
+    assert_eq!(pane_size(&server, panes[1]), pane_size(&server, panes[0]));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn paced_queue_skips_tabs_closed_while_queued() {
+    let (mut server, panes, _) = paced_server();
+    let (control, _) = connect_test_shell(&mut server, 94, 100, 30);
+    let _ = control.recv().expect("snapshot");
+    send_shell_resize(&mut server, 94, 110, 32);
+    server.hidden_resize.tabs.push_back("no-such-tab".into());
+    server.hidden_resize.tabs.push_front("no-such-tab".into());
+
+    drain_hidden_resizes(&mut server);
+    for &pane in &panes[1..] {
+        assert_eq!(pane_size(&server, pane), pane_size(&server, panes[0]));
+    }
+    assert!(server.hidden_resize.due.is_none());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn paced_reattach_at_new_size_queues_hidden_tabs_and_resizes_viewed_now() {
+    let (mut server, panes, _) = paced_server();
+    let (control, _) = connect_test_shell(&mut server, 95, 100, 30);
+    let _ = control.recv().expect("snapshot");
+    drain_hidden_resizes(&mut server);
+    server.remove_client_and_resize_if_needed(95);
+    let before: Vec<u64> = panes.iter().map(|&p| resize_count(&server, p)).collect();
+
+    let (control, _) = connect_test_shell(&mut server, 96, 120, 40);
+    let _ = control.recv().expect("snapshot");
+    assert_ne!(resize_count(&server, panes[0]), before[0]);
+    for i in 1..panes.len() {
+        assert_eq!(resize_count(&server, panes[i]), before[i], "tab {i}");
+    }
+    drain_hidden_resizes(&mut server);
+    for &pane in &panes[1..] {
+        assert_eq!(pane_size(&server, pane), pane_size(&server, panes[0]));
+    }
+    shutdown_test_runtimes(&mut server);
 }

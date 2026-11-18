@@ -166,6 +166,19 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Quiet period after the last host resize before hidden tabs start to follow it.
+const HIDDEN_RESIZE_SETTLE: Duration = Duration::from_millis(250);
+/// Gap between hidden tab resizes, so their agents do not all redraw at once.
+const HIDDEN_RESIZE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Hidden tabs that still have to adopt the lone client's geometry, one per interval.
+#[derive(Default)]
+struct HiddenResizeQueue {
+    /// Stable tab ids; sizes are read from the client when each tab is resized.
+    tabs: std::collections::VecDeque<String>,
+    due: Option<Instant>,
+}
+
 // Split shell redraws need several early updates; sustained output still coalesces.
 const INTERACTIVE_RENDER_BUDGET: u8 = 16;
 const INTERACTIVE_RENDER_WINDOW: Duration = Duration::from_millis(32);
@@ -210,6 +223,7 @@ pub struct HeadlessServer {
     foreground_client_id: Option<u64>,
     /// Ephemeral shell connection controlling PTY geometry for each stable tab id.
     tab_geometry_controllers: HashMap<String, u64>,
+    hidden_resize: HiddenResizeQueue,
     /// Stable tab id whose viewers may see and interact with the one terminal popup.
     popup_owner_tab_id: Option<String>,
     /// Process-local identity used to reject shell replacements from an earlier server boot.
@@ -365,6 +379,7 @@ impl HeadlessServer {
             next_client_id: 1,
             foreground_client_id: None,
             tab_geometry_controllers: HashMap::new(),
+            hidden_resize: HiddenResizeQueue::default(),
             popup_owner_tab_id: None,
             client_shell_boot_id: format!(
                 "{}-{}",
@@ -622,6 +637,13 @@ impl HeadlessServer {
                 .map(|pending| pending.next_deadline())
                 .fold(next_deadline, |deadline, pending| {
                     Some(deadline.map_or(pending, |current| current.min(pending)))
+                });
+            let next_deadline = self
+                .hidden_resize
+                .due
+                .into_iter()
+                .fold(next_deadline, |deadline, due| {
+                    Some(deadline.map_or(due, |current| current.min(due)))
                 });
             let event = {
                 tokio::select! {
@@ -2254,7 +2276,9 @@ impl HeadlessServer {
                 }
                 client.request_repaint();
                 self.promote_client_to_foreground(client_id);
-                self.resize_shell_tab_if_controller(client_id, true);
+                if self.resize_shell_tab_if_controller(client_id, true) {
+                    self.requeue_hidden_resize(client_id);
+                }
                 true
             }
             ServerEvent::ClientShellHostTheme { client_id, update } => {
@@ -3277,6 +3301,7 @@ impl HeadlessServer {
             return false;
         }
         let mut changed = false;
+        self.drain_hidden_resize(now);
 
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
